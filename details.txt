@@ -1,0 +1,295 @@
+# Détection de Fraude avec LightGBM
+
+Ce notebook implémente un pipeline de détection de fraudes sur le dataset IEEE-CIS Fraud Detection. Les étapes incluent :
+- Fusion des fichiers `train_transaction.csv` et `train_identity.csv` (et leurs équivalents de test).
+- Prétraitement : imputation des valeurs manquantes, encodage des variables catégoriques, standardisation.
+- Entraînement d'un modèle LightGBM sur un échantillon de 100 000 lignes.
+- Évaluation avec rapport de classification, matrice de confusion, courbes ROC et Précision-Rappel.
+- Sauvegarde des artefacts (modèle, outils de prétraitement, métriques, visualisations).
+
+**Objectifs** : Pipeline reproductible, modulaire, applicable aux données de test.
+
+**Sorties** : `model_lightgbm.pkl`, `imputer_num.pkl`, `imputer_cat.pkl`, `scaler.pkl`, `encoders.pkl`, `classification_report.txt`, `confusion_matrix.png`, `roc_curve.png`, `pr_curve.png`, `submission.csv`.
+
+**Correction** : Gestion des différences de nomenclature entre `train_identity.csv` (id_XX) et `test_identity.csv` (id-XX).
+# Importation des bibliothèques
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import lightgbm as lgb
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, precision_recall_curve, roc_auc_score
+from sklearn.model_selection import train_test_split
+import pickle
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configuration des visualisations
+sns.set(style="whitegrid")
+plt.rcParams['figure.figsize'] = (10, 6)
+
+# Création du dossier pour sauvegarder les artefacts
+output_dir = "fraud_detection_artifacts"
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+## 1. Chargement et Fusion des Données
+
+Chargement des fichiers `train_transaction.csv` et `train_identity.csv`, puis fusion sur `TransactionID` avec une jointure à gauche. Même processus pour les données de test, avec renommage des colonnes `id-XX` en `id_XX` pour harmoniser.
+def load_and_merge_data(transaction_file, identity_file, is_test=False):
+    transaction_df = pd.read_csv(transaction_file)
+    identity_df = pd.read_csv(identity_file)
+    
+    # Renommer les colonnes de test_identity.csv (id-XX -> id_XX) si is_test=True
+    if is_test:
+        identity_df.columns = [col.replace('id-', 'id_') for col in identity_df.columns]
+    
+    merged_df = transaction_df.merge(identity_df, on="TransactionID", how="left")
+    print(f"Dimensions transaction: {transaction_df.shape}")
+    print(f"Dimensions identity: {identity_df.shape}")
+    print(f"Dimensions merged: {merged_df.shape}")
+    return merged_df
+
+# Chargement des données d'entraînement
+train_df = load_and_merge_data("train_transaction.csv", "train_identity.csv", is_test=False)
+
+# Échantillonnage de 100 000 lignes
+#train_df = train_df.sample(n=100000, random_state=42)
+print(f"training data: {train_df.shape}")
+## 2. Prétraitement
+
+- Imputation : moyenne pour les colonnes numériques, mode pour les catégoriques.
+- Encodage : LabelEncoder pour les variables catégoriques.
+- Standardisation : StandardScaler pour les colonnes numériques.
+- Alignement des colonnes : Seules les colonnes communes entre entraînement et test sont utilisées.
+def preprocess_data(df, numerical_cols, categorical_cols, is_train=True, imputer_num=None, imputer_cat=None, scaler=None, encoders=None):
+    df_processed = df.copy()
+    
+    # Filtrer les colonnes pour ne garder que celles présentes dans df_processed
+    numerical_cols = [col for col in numerical_cols if col in df_processed.columns]
+    categorical_cols = [col for col in categorical_cols if col in df_processed.columns]
+    
+    # Imputation des valeurs manquantes
+    if is_train:
+        imputer_num = SimpleImputer(strategy='mean')
+        imputer_cat = SimpleImputer(strategy='most_frequent')
+        scaler = StandardScaler()
+        encoders = {}
+    else:
+        assert imputer_num is not None and imputer_cat is not None and scaler is not None and encoders is not None
+    
+    # Imputation pour colonnes numériques
+    if numerical_cols:
+        df_processed[numerical_cols] = imputer_num.fit_transform(df_processed[numerical_cols]) if is_train else imputer_num.transform(df_processed[numerical_cols])
+    
+    # Imputation pour colonnes catégoriques
+    if categorical_cols:
+        df_processed[categorical_cols] = imputer_cat.fit_transform(df_processed[categorical_cols]) if is_train else imputer_cat.transform(df_processed[categorical_cols])
+    
+    # Standardisation des colonnes numériques
+    if numerical_cols:
+        df_processed[numerical_cols] = scaler.fit_transform(df_processed[numerical_cols]) if is_train else scaler.transform(df_processed[numerical_cols])
+    
+    # Encodage des variables catégoriques avec LabelEncoder
+    if is_train:
+        for col in categorical_cols:
+            encoders[col] = LabelEncoder()
+            df_processed[col] = encoders[col].fit_transform(df_processed[col].astype(str))
+    else:
+        for col in categorical_cols:
+            # Gérer les valeurs inconnues dans le test
+            df_processed[col] = df_processed[col].astype(str).map(lambda x: x if x in encoders[col].classes_ else encoders[col].classes_[0])
+            df_processed[col] = encoders[col].transform(df_processed[col])
+    
+    return df_processed, imputer_num, imputer_cat, scaler, encoders
+
+# Identifier les colonnes
+categorical_cols = train_df.select_dtypes(include='object').columns.tolist()
+numerical_cols = train_df.select_dtypes(include=['int64', 'float64']).columns.difference(['isFraud', 'TransactionID']).tolist()
+
+# Prétraitement des données d'entraînement
+train_df_processed, imputer_num, imputer_cat, scaler, encoders = preprocess_data(
+    train_df, numerical_cols, categorical_cols, is_train=True
+)
+
+# Sauvegarde des outils de prétraitement
+def save_artifact(obj, filename):
+    with open(os.path.join(output_dir, filename), 'wb') as f:
+        pickle.dump(obj, f)
+    print(f"Saved: {filename}")
+
+save_artifact(imputer_num, "imputer_num.pkl")
+save_artifact(imputer_cat, "imputer_cat.pkl")
+save_artifact(scaler, "scaler.pkl")
+save_artifact(encoders, "encoders.pkl")
+## 3. Entraînement du Modèle LightGBM
+
+Entraînement d'un modèle LightGBM sur les données prétraitées avec validation.
+# Séparation des features et de la cible
+X = train_df_processed.drop(['isFraud', 'TransactionID'], axis=1)
+y = train_df_processed['isFraud']
+
+# Split pour validation
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+# Entraînement du modèle LightGBM
+lgb_model = lgb.LGBMClassifier(random_state=42, n_jobs=-1)
+lgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], eval_metric='auc')
+
+# Sauvegarde du modèle
+save_artifact(lgb_model, "model_lightgbm.pkl")
+## 4. Évaluation du Modèle
+
+Évaluation avec rapport de classification, matrice de confusion, courbes ROC et Précision-Rappel.
+def save_metrics_and_plots(y_true, y_pred, y_prob):
+    # Rapport de classification
+    report = classification_report(y_true, y_pred)
+    with open(os.path.join(output_dir, "classification_report.txt"), 'w') as f:
+        f.write(report)
+    print("Saved: classification_report.txt")
+    
+    # Matrice de confusion
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure()
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.title("Confusion Matrix")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
+    plt.close()
+    print("Saved: confusion_matrix.png")
+    
+    # Courbe ROC
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    plt.figure()
+    plt.plot(fpr, tpr, label=f"ROC AUC = {roc_auc_score(y_true, y_prob):.2f}")
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve")
+    plt.legend()
+    plt.savefig(os.path.join(output_dir, "roc_curve.png"))
+    plt.close()
+    print("Saved: roc_curve.png")
+    
+    # Courbe Précision-Rappel
+    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    plt.figure()
+    plt.plot(recall, precision)
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curve")
+    plt.savefig(os.path.join(output_dir, "pr_curve.png"))
+    plt.close()
+    print("Saved: pr_curve.png")
+
+# Prédictions et évaluation
+y_pred = lgb_model.predict(X_val)
+y_prob = lgb_model.predict_proba(X_val)[:, 1]
+save_metrics_and_plots(y_val, y_pred, y_prob)
+## 5. Prédictions sur les Données de Test
+
+Application du même prétraitement aux données de test et génération des prédictions.
+import pandas as pd
+import pickle
+import os
+
+# Fonction pour charger et fusionner les données
+def load_and_merge_data(transaction_file, identity_file, is_test=True):
+    transaction_df = pd.read_csv(transaction_file)
+    identity_df = pd.read_csv(identity_file)
+    
+    # Renommer les colonnes de test_identity.csv (id-XX -> id_XX)
+    if is_test:
+        identity_df.columns = [col.replace('id-', 'id_') for col in identity_df.columns]
+    
+    merged_df = transaction_df.merge(identity_df, on="TransactionID", how="left")
+    print(f"Dimensions transaction: {transaction_df.shape}")
+    print(f"Dimensions identity: {identity_df.shape}")
+    print(f"Dimensions merged: {merged_df.shape}")
+    return merged_df
+
+# Fonction de prétraitement
+def preprocess_data(df, numerical_cols, categorical_cols, imputer_num, imputer_cat, scaler, encoders):
+    df_processed = df.copy()
+    
+    # Filtrer les colonnes pour ne garder que celles présentes dans df_processed
+    numerical_cols = [col for col in numerical_cols if col in df_processed.columns]
+    categorical_cols = [col for col in categorical_cols if col in df_processed.columns]
+    
+    # Imputation pour colonnes numériques
+    if numerical_cols:
+        df_processed[numerical_cols] = imputer_num.transform(df_processed[numerical_cols])
+    
+    # Imputation pour colonnes catégoriques
+    if categorical_cols:
+        df_processed[categorical_cols] = imputer_cat.transform(df_processed[categorical_cols])
+    
+    # Standardisation des colonnes numériques
+    if numerical_cols:
+        df_processed[numerical_cols] = scaler.transform(df_processed[numerical_cols])
+    
+    # Encodage des variables catégoriques avec LabelEncoder
+    for col in categorical_cols:
+        # Gérer les valeurs inconnues dans le test
+        df_processed[col] = df_processed[col].astype(str).map(lambda x: x if x in encoders[col].classes_ else encoders[col].classes_[0])
+        df_processed[col] = encoders[col].transform(df_processed[col])
+    
+    return df_processed
+
+# Fonction pour charger un artefact
+def load_artifact(filename):
+    with open(os.path.join("fraud_detection_artifacts", filename), 'rb') as f:
+        return pickle.load(f)
+
+# Fonction principale
+def main():
+    # Charger les artefacts
+    imputer_num = load_artifact("imputer_num.pkl")
+    imputer_cat = load_artifact("imputer_cat.pkl")
+    scaler = load_artifact("scaler.pkl")
+    encoders = load_artifact("encoders.pkl")
+    model = load_artifact("model_lightgbm.pkl")
+    print("All artifacts loaded successfully.")
+
+    # Définir les colonnes numériques et catégoriques (basées sur l'entraînement)
+    categorical_cols = list(encoders.keys())
+    numerical_cols = list(imputer_num.feature_names_in_) if hasattr(imputer_num, 'feature_names_in_') else []
+    
+    # Charger et fusionner les données de test
+    test_df = load_and_merge_data("test_transaction.csv", "test_identity.csv", is_test=True)
+    
+    # Prétraitement des données de test
+    test_df_processed = preprocess_data(
+        test_df, numerical_cols, categorical_cols,
+        imputer_num=imputer_num, imputer_cat=imputer_cat, scaler=scaler, encoders=encoders
+    )
+    
+    # Prédictions sur les données de test
+    X_test = test_df_processed.drop(['TransactionID'], axis=1, errors='ignore')
+    
+    # S'assurer que X_test a les mêmes colonnes que celles utilisées pour l'entraînement
+    model_features = model.feature_names_in_ if hasattr(model, 'feature_names_in_') else X_test.columns
+    X_test = X_test.reindex(columns=model_features, fill_value=0)
+    
+    test_pred_prob = model.predict_proba(X_test)[:, 1]
+    
+    # Sauvegarde des prédictions
+    submission = pd.DataFrame({
+        'TransactionID': test_df['TransactionID'],
+        'isFraud': test_pred_prob
+    })
+    submission.to_csv(os.path.join("fraud_detection_artifacts", "submission.csv"), index=False)
+    print("Saved: submission.csv")
+
+if __name__ == "__main__":
+    main()
+## 6. Conclusion
+
+Le pipeline est complet, reproductible et prêt à être utilisé pour la détection de fraudes. Les artefacts sont sauvegardés dans le dossier `fraud_detection_artifacts`. Pour améliorer les performances, envisagez :
+- Optimisation des hyperparamètres de LightGBM.
+- Feature engineering (ex. : ratios, indicateurs temporels).
+- Gestion des classes déséquilibrées avec SMOTE ou `scale_pos_weight`.
+- Validation croisée stratifiée.
