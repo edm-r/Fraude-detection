@@ -65,16 +65,19 @@ const PredictCSVPage: React.FC = () => {
       return;
     }
 
-    const exportData = results.map(result => ({
-      transaction_id: result.id,
-      amount: result.transaction.TransactionAmt,
-      product_code: result.transaction.ProductCD,
-      card_type: result.transaction.card4,
-      fraud_label: result.prediction.label,
-      fraud_probability: result.prediction.probability,
-      fraud_score: result.prediction.fraud_score,
-      timestamp: result.timestamp,
-    }));
+    const exportData = results.map((result, idx) => {
+      const original = allRows[idx] || {};
+      return {
+        transaction_id: result.id,
+        Amount: original.TransactionAmt, // valeur d'origine
+        ProductCD: original.ProductCD,   // valeur d'origine
+        card_4: original.card4,          // valeur d'origine
+        fraud_label: result.prediction.label,
+        fraud_probability: result.prediction.probability,
+        fraud_score: result.prediction.fraud_score,
+        timestamp: result.timestamp,
+      };
+    });
 
     exportToCSV(exportData, `fraud_analysis_${new Date().toISOString().split('T')[0]}.csv`);
     toast.success('Results exported successfully');
